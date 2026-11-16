@@ -1,0 +1,242 @@
+# Tiny Shop: uninstrumented demo app for testing OTel SDK auto-injection.
+#
+#   loadgen --> frontend (Node.js) --> orders (Python/Flask) --> inventory (Java/Spring Boot)
+#                                            |
+#                                            +--> redis
+#
+# No OpenTelemetry SDKs, env vars, or injection annotations are set here on purpose;
+# the instrumentation flow under test is expected to add them.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tiny-shop
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: tiny-shop
+  labels: &labels
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: tiny-shop
+    demo.grafana.com/language: nodejs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      containers:
+        - name: frontend
+          image: tiny-shop/frontend:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ORDERS_URL
+              value: http://orders:8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: tiny-shop
+  labels:
+    app.kubernetes.io/name: frontend
+spec:
+  selector:
+    app.kubernetes.io/name: frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders
+  namespace: tiny-shop
+  labels: &labels
+    app.kubernetes.io/name: orders
+    app.kubernetes.io/part-of: tiny-shop
+    demo.grafana.com/language: python
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orders
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      containers:
+        - name: orders
+          image: tiny-shop/orders:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: INVENTORY_URL
+              value: http://inventory:8080
+            - name: REDIS_HOST
+              value: redis
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 384Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders
+  namespace: tiny-shop
+  labels:
+    app.kubernetes.io/name: orders
+spec:
+  selector:
+    app.kubernetes.io/name: orders
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory
+  namespace: tiny-shop
+  labels: &labels
+    app.kubernetes.io/name: inventory
+    app.kubernetes.io/part-of: tiny-shop
+    demo.grafana.com/language: java
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inventory
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      containers:
+        - name: inventory
+          image: tiny-shop/inventory:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            # Headroom for the Java agent once it is injected.
+            limits: { memory: 768Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory
+  namespace: tiny-shop
+  labels:
+    app.kubernetes.io/name: inventory
+spec:
+  selector:
+    app.kubernetes.io/name: inventory
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: tiny-shop
+  labels: &labels
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: tiny-shop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: tiny-shop
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+# Steady background traffic so telemetry shows up as soon as instrumentation lands.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: tiny-shop
+  labels: &labels
+    app.kubernetes.io/name: loadgen
+    app.kubernetes.io/part-of: tiny-shop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: loadgen
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      containers:
+        - name: loadgen
+          image: curlimages/curl:8.10.1
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              FE=http://frontend:8080
+              SKUS="sku-apple sku-banana sku-cherry sku-durian sku-unknown"
+              echo "generating load against $FE"
+              i=0
+              while true; do
+                i=$((i+1))
+                sku=$(echo $SKUS | tr ' ' '\n' | sed -n "$(( (i % 5) + 1 ))p")
+                curl -s -o /dev/null -w "checkout $sku -> %{http_code}\n" -X POST "$FE/api/checkout?sku=$sku&qty=$(( (i % 3) + 1 ))"
+                [ $((i % 4)) -eq 0 ] && curl -s -o /dev/null -w "products -> %{http_code}\n" "$FE/api/products"
+                [ $((i % 7)) -eq 0 ] && curl -s -o /dev/null -w "orders -> %{http_code}\n" "$FE/api/orders"
+                sleep 1
+              done
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
